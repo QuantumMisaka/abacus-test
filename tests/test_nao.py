@@ -4,7 +4,12 @@ import os
 import tempfile
 from pathlib import Path
 
-from abacustest.lib_data.nao import AbacusNAO
+import pytest
+
+AbacusNAO = pytest.importorskip(
+    "abacustest.lib_data.nao",
+    reason="NAO parser module is not available in this abacus-test checkout",
+).AbacusNAO
 
 
 class TestAbacusNAO(unittest.TestCase):

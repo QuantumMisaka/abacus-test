@@ -58,3 +58,10 @@ version = { attr = "abacustest.version.__version__" }
 [tool.setuptools.package-data]
 abacustest = ["*.py", "*/*.py", "*/*/*.py", "lib_prepare/input-params.json"]
 "abacustest.skills" = ["*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q"
+testpaths = ["tests"]
+markers = [
+    "legacy: upstream compatibility tests retained for reference",
+]
