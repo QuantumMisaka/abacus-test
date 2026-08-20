@@ -5,6 +5,90 @@ import numpy as np
 
 KS_SOLVER_LIST = ['DA','DS','GE','GV','BP','CG','CU','PE','LA']
 
+
+def _discover_stdout_paths(result):
+    """Discover captured stdout before falling back to running_*.log."""
+    paths = []
+
+    def add(path):
+        if path is None:
+            return
+        path = os.fspath(path)
+        if not os.path.isabs(path) and not os.path.isfile(path):
+            path = os.path.join(os.fspath(result.PATH), path)
+        path = os.path.abspath(path)
+        if os.path.isfile(path) and path not in paths:
+            paths.append(path)
+
+    add(getattr(result, "OUTPUTf", None))
+    for name in ("abacus.log", "abacus.out"):
+        add(os.path.join(result.PATH, name))
+    candidates = []
+    for pattern in ("*.out", "*.log", "*.stdout"):
+        candidates.extend(glob.glob(os.path.join(os.fspath(result.PATH), pattern)))
+    running_log = os.path.abspath(os.fspath(getattr(result, "LOGf", "")))
+    for path in sorted(set(candidates)):
+        if os.path.abspath(path) != running_log:
+            add(path)
+    # Keep the running log as the final candidate.  Some ABACUS fixtures have
+    # a short scheduler stdout plus the force table only in running_*.log.
+    add(getattr(result, "LOGf", None))
+    return paths
+
+
+def _stdout_lines(result):
+    lines = []
+    for path in _discover_stdout_paths(result):
+        lines.extend(comm.ReadFile(path, warn=False))
+    return lines
+
+
+def _mobility_components(result):
+    """Read per-atom Cartesian mobility flags from the root STRU."""
+    mobility = []
+    in_positions = False
+    float_pattern = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+    for line in result.STRU:
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("ATOMIC_POSITIONS"):
+            in_positions = True
+            continue
+        if not in_positions:
+            continue
+        tokens = stripped.split()
+        if len(tokens) < 3 or not all(float_pattern.match(token) for token in tokens[:3]):
+            continue
+        atom_mobility = None
+        for index, token in enumerate(tokens[3:], 3):
+            if token.lower() == "m" and len(tokens) >= index + 4:
+                try:
+                    values = [int(tokens[index + offset]) for offset in range(1, 4)]
+                except ValueError:
+                    values = []
+                if len(values) == 3 and all(value in (0, 1) for value in values):
+                    atom_mobility = values
+                break
+        if atom_mobility is None and len(tokens) == 6:
+            try:
+                values = [int(token) for token in tokens[3:6]]
+            except ValueError:
+                values = []
+            if len(values) == 3 and all(value in (0, 1) for value in values):
+                atom_mobility = values
+        mobility.append(atom_mobility)
+    return mobility
+
+
+def _energy_difference(lines):
+    number = r"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
+    for line in reversed(lines):
+        if re.search(r"energy\s+difference|energy\s+diff", line, re.IGNORECASE):
+            values = re.findall(number, line)
+            if values:
+                return float(values[-1])
+    return None
+
 class Abacus(ResultAbacus):
     
     @ResultAbacus.register(version="the version of ABACUS")
@@ -80,12 +164,10 @@ class Abacus(ResultAbacus):
             except:
                 return ii
 
-        INPUTf = os.path.join(self.PATH,"OUT.%s/INPUT" % self.SUFFIX)
-        if os.path.isfile(INPUTf):
-            with open(INPUTf) as f1:
-                input_context = f1.readlines()
-        else:
-            input_context = self.INPUT
+        # The input at the job root is the user-owned source of truth.  The
+        # copy in OUT.* is generated runtime state and may contain defaults or
+        # values from a different execution, so it must not replace self.INPUT.
+        input_context = self.INPUT
         
         readinput = False
         INPUT = {}
@@ -99,7 +181,8 @@ class Abacus(ResultAbacus):
                 if len(sline) == 2:
                     INPUT[sline[0].lower()] = str2intfloat(sline[1].strip())
         self["INPUT"] = INPUT
-    
+        return INPUT
+
     @ResultAbacus.register(kpt="list, the K POINTS setting in KPT file")
     def GetKptParam(self):
         if len(self.KPT) > 3:
@@ -313,26 +396,27 @@ class Abacus(ResultAbacus):
                            forces = "list of force, the force of each ION step. Dimension is [nstep,3*natom]")
     def GetForceFromLog(self):
         forces = []
-        for i in range(len(self.LOG)):
+        evidence = _stdout_lines(self)
+        for i in range(len(evidence)):
             #i = -1*i - 1
-            line = self.LOG[i]
+            line = evidence[i]
             if 'TOTAL-FORCE (eV/Angstrom)' in line:
                 #head_pattern = re.compile(r'^\s*atom\s+x\s+y\s+z\s*$')
-                value_pattern = re.compile(r'^\s*[A-Z][a-z]?[1-9][0-9]*\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s*$')
-                j = i
+                value_pattern = re.compile(r'^\s*\S+\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s*$')
+                j = i + 1
                 noforce = False
-                while not value_pattern.match(self.LOG[j]):
+                while j < len(evidence) and not value_pattern.match(evidence[j]):
                     j += 1
-                    if j >= i + 10:
+                    if j >= i + 10 or j >= len(evidence):
                         print("Warning: can not find the first line of force")
                         noforce = True
                         break
                 if noforce:
-                    break
+                    continue
                 
                 force = []
-                while value_pattern.match(self.LOG[j]):
-                    force += [float(ii) for ii in self.LOG[j].split()[1:4]]
+                while j < len(evidence) and value_pattern.match(evidence[j]):
+                    force += [float(ii) for ii in evidence[j].split()[1:4]]
                     j += 1
                 if force: forces.append(force)
         if forces:        
@@ -402,25 +486,54 @@ class Abacus(ResultAbacus):
                            largest_gradient_stress="list, the largest stress of each ION step. Unit in kbar")
     def GetLargestGradientFromLog(self):
         lg, lg_stress = None, None
-        for line in self.LOG:
-            if "Largest gradient in force" in line:
+        explicit = []
+        number = r"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
+        for line in _stdout_lines(self):
+            if re.search(r"largest\s+gradient\s+in\s+force", line, re.IGNORECASE):
                 if lg == None:
                     lg = []
-                lg.append(float(line.split()[-2]))
-            elif "Largest gradient is" in line:
-                if lg == None:
-                    lg = []
-                lg.append(float(line.split()[-1]))
+                matches = re.findall(number, line)
+                if matches:
+                    explicit.append(float(matches[-1]))
+            elif re.search(r"largest\s+gradient\s+is", line, re.IGNORECASE):
+                matches = re.findall(number, line)
+                if matches:
+                    explicit.append(float(matches[-1]))
+            elif re.search(r"largest\s+grad(?:ient)?\s*=", line, re.IGNORECASE):
+                matches = re.findall(number, line.split("=", 1)[1])
+                if matches:
+                    explicit.append(float(matches[0]))
+            elif re.search(r"largest\s+force\s*=|largest\s+force\s+", line, re.IGNORECASE):
+                matches = re.findall(number, line.split("force", 1)[-1])
+                if matches:
+                    explicit.append(float(matches[0]))
             elif "Largest gradient in stress" in line:
                 # Largest gradient in stress is 10.208693
                 if lg_stress == None:
                     lg_stress = []
-                lg_stress.append(float(line.split()[5]))
+                matches = re.findall(number, line)
+                if matches:
+                    lg_stress.append(float(matches[-1]))
+
+        # Explicit ABACUS markers are authoritative over force-table fallback.
+        if explicit:
+            lg = explicit
         
         if lg is None:
             forces = self["forces"]
             if forces is not None:
-                lg = [max([abs(i) for i in j]) for j in forces]
+                mobility = _mobility_components(self)
+                values = []
+                for force in forces:
+                    selected = []
+                    for atom_index in range(len(force) // 3):
+                        atom_mobility = mobility[atom_index] if atom_index < len(mobility) else None
+                        for component in range(3):
+                            if atom_mobility is None or atom_mobility[component]:
+                                selected.append(abs(force[3 * atom_index + component]))
+                    values.append(max(selected) if selected else None)
+                if any(value is not None for value in values):
+                    lg = values
         
         if lg_stress is None:
             stresses = self["stresses"]
@@ -429,7 +542,8 @@ class Abacus(ResultAbacus):
 
         self['largest_gradient'] = lg
         self['largest_gradient_stress'] = lg_stress
-    
+        return lg[-1] if lg else None
+
     @ResultAbacus.register(k_coord="list, the direct k point coordinates in the BZ",)
     def GetKCoordFromLog(self):
         coord = []
@@ -1073,44 +1187,65 @@ Fe2
 class AbacusRelax(ResultAbacus):
     @ResultAbacus.register(relax_converge="if the relax is converged")
     def GetRelaxConverge(self):
-        #need read self.LOG
         converge = None
-        if self.LOG:
-            for i in range(len(self.LOG)):
-                line = self.LOG[-i-1]
-                if "Relaxation is converged!" in line:
-                    converge = True
-                elif "Relaxation is not converged yet!" in line:
-                    converge = False
-                elif "Ion relaxation is not converged yet" in line or \
-                    "Lattice relaxation is not converged yet" in line:
-                    converge = False
-                elif "Lattice relaxation is converged!" in line or \
-                    "Ion relaxation is converged!" in line:
-                    converge = True
-                if converge is not None:
-                    break
+        evidence = _stdout_lines(self)
+        for line in reversed(evidence):
+            if "Relaxation is converged!" in line:
+                converge = True
+            elif "Relaxation is not converged yet!" in line:
+                converge = False
+            elif "Ion relaxation is not converged yet" in line or \
+                "Lattice relaxation is not converged yet" in line:
+                converge = False
+            elif "Lattice relaxation is converged!" in line or \
+                "Ion relaxation is converged!" in line:
+                converge = True
+            if converge is not None:
+                break
 
-            # in some version, ABACUS will not output the statement of convergence, we need to check the last step
-            if converge is None:
-                lg_force = self["largest_gradient"]
-                lg_stress = self["largest_gradient_stress"]
-                job_type = self["INPUT"].get("calculation", "scf")
-                force_thr = self["INPUT"].get("force_thr_ev")
-                stress_thr = self["INPUT"].get("stress_thr")
-                if job_type == "relax" and lg_force is not None and force_thr is not None:
-                    if lg_force[-1] < force_thr:
-                        converge = True
-                    else:
-                        converge = False
-                elif job_type == "cell-relax" and lg_force is not None and force_thr is not None and lg_stress is not None and stress_thr is not None:
-                    if lg_force[-1] < force_thr and  lg_stress[-1] < stress_thr:
-                        converge = True
-                    else:
-                        converge = False
+        # In some versions ABACUS does not print an explicit statement.  Use
+        # only evidence that is actually present; a missing stdout must remain
+        # unknown instead of being reported as a failed relaxation.
+        if converge is None:
+            lg_force = self["largest_gradient"]
+            lg_stress = self["largest_gradient_stress"]
+            params = self["INPUT"]
+            job_type = params.get("calculation", "scf")
+            force_thr = params.get("force_thr_ev")
+            if force_thr is None and params.get("force_thr") is not None:
+                force_thr = float(params["force_thr"]) * 25.711396132
+            if isinstance(lg_force, list) and lg_force:
+                latest_force = lg_force[-1]
+            else:
+                latest_force = lg_force
+            force_ok = (
+                latest_force is not None and force_thr is not None and
+                latest_force <= float(force_thr)
+            )
+            if job_type == "relax" and latest_force is not None and force_thr is not None:
+                relax_new = params.get("relax_new", 1)
+                is_new = str(relax_new).strip().lower() not in ("0", "false", "no", "off")
+                if is_new:
+                    converge = force_ok
+                else:
+                    # The legacy relaxation path has two required pieces of
+                    # evidence: force and electronic energy difference.
+                    energy_difference = _energy_difference(evidence)
+                    energy_thr = params.get("scf_ene_thr")
+                    if energy_thr is None:
+                        energy_thr = params.get("energy_thr", params.get("relax_energy_thr"))
+                    if energy_difference is not None and energy_thr is not None and float(energy_thr) >= 0:
+                        converge = force_ok and abs(energy_difference) <= float(energy_thr)
+            elif job_type == "cell-relax" and force_ok:
+                if isinstance(lg_stress, list) and lg_stress:
+                    stress_thr = params.get("stress_thr")
+                    converge = stress_thr is not None and lg_stress[-1] <= float(stress_thr)
+                else:
+                    converge = None
 
         self["relax_converge"] = converge
-    
+        return converge
+
     @ResultAbacus.register(relax_steps= "the total ION steps")
     def GetRelaxSteps(self):
         #need read self.LOG
