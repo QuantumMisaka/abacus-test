@@ -14,26 +14,36 @@ def eos_fit(volume,energy):
     if len(v) < 4:
         print('Error: Not enough data points to fit the equation of state')
         return None
-    v,e = zip(*sorted(zip(v,e)))
-    
-    ve = np.array([v,e]).T
-    fitdata = np.polyfit(ve[:, 0] ** (-2. / 3.),ve[:, 1], 3, full=True)
-    residuals0 = (fitdata[1] / len(ve[:, 0]))**0.5
-    deriv0 = np.poly1d(fitdata[0])
+
+    ve = np.asarray(sorted(zip(v, e)), dtype=float)
+    if not np.isfinite(ve).all():
+        raise ValueError('EOS volumes and energies must be finite')
+    if np.any(ve[:, 0] <= 0):
+        raise ValueError('EOS volumes must be finite positive values')
+    if len(np.unique(ve[:, 0])) != len(ve[:, 0]):
+        raise ValueError('EOS fitting requires unique volume samples')
+
+    coefficients = np.polyfit(ve[:, 0] ** (-2. / 3.),ve[:, 1], 3)
+    deriv0 = np.poly1d(coefficients)
     deriv1 = np.polyder(deriv0, 1)
     deriv2 = np.polyder(deriv1, 1)
     deriv3 = np.polyder(deriv2, 1)
-    
-    volume0 = 0
-    x = 0
-    for x in np.roots(deriv1):
-        if x > 0 and deriv2(x) > 0:
+
+    volume0 = None
+    minimum_root = None
+    for root in np.roots(deriv1):
+        if not np.isclose(np.imag(root), 0.0, atol=1e-10):
+            continue
+        x = float(np.real(root))
+        if x > 0 and float(deriv2(x)) > 0:
             volume0 = x**(-3./2.)
+            minimum_root = x
             break
 
-    if volume0 == 0:
-        print('Error: No minimum could be found')
-    
+    if volume0 is None or minimum_root is None:
+        raise RuntimeError('No positive Birch-Murnaghan minimum could be found')
+
+    x = minimum_root
     derivV2 = 4./9. * x**5. * deriv2(x)
     derivV3 = (-20./9. * x**(13./2.) * deriv2(x) -
         8./27. * x**(15./2.) * deriv3(x))
@@ -44,7 +54,12 @@ def eos_fit(volume,energy):
     fit_x = np.linspace(min(min(ve[:,0]),volume0), max(max(ve[:,0]),volume0), 100)
     fit_y = deriv0(fit_x**(-2./3.))
     e0 = deriv0(volume0**(-2./3.))
-    return float(volume0), float(e0), fit_x.tolist(), fit_y.tolist(), float(b0), float(bulk_deriv0), float(residuals0)
+    predicted_energy = deriv0(ve[:, 0] ** (-2. / 3.))
+    residual0 = float(np.sqrt(np.mean((predicted_energy - ve[:, 1]) ** 2)))
+    parameters = np.asarray([volume0, e0, b0, bulk_deriv0, residual0], dtype=float)
+    if not np.isfinite(parameters).all():
+        raise RuntimeError('EOS fitting produced non-finite parameters')
+    return float(volume0), float(e0), fit_x.tolist(), fit_y.tolist(), float(b0), float(bulk_deriv0), residual0
 
 def cal_delta(v0, b0, bp, v0_ref, b0_ref, bp_ref):
     # v0, b0, bp: volume, bulk modulus, bulk modulus derivative of the material
@@ -197,5 +212,3 @@ def plot_eos_one(ax,results, results_ref=None, label_size=16, legend_size=14,x_l
             ax.legend(loc="upper right",fontsize=legend_size)
             
     return {"fit":fit1,"fit_ref":ref_fit1,"delta":delta}
-        
-    
