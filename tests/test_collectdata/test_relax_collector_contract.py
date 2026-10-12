@@ -5,7 +5,7 @@ import pytest
 from abacustest.lib_collectdata.collectdata import RESULT
 
 
-def _stru(mobility):
+def _stru(mobility, *, style="m"):
     lines = [
         "ATOMIC_SPECIES",
         "H 1.0 H.upf",
@@ -22,9 +22,22 @@ def _stru(mobility):
         str(len(mobility)),
     ]
     for index, components in enumerate(mobility):
-        lines.append(
-            "{0}.0 0.0 0.0 m {1} {2} {3}".format(index, *components)
-        )
+        flags = "{0} {1} {2}".format(*components)
+        if style == "m":
+            suffix = f"m {flags}"
+        elif style == "bare":
+            suffix = flags
+        elif style == "bare_velocity":
+            suffix = f"{flags} v 0.000000 0.000000 0.000000"
+        elif style == "m_velocity":
+            suffix = f"m {flags} v 0.000000 0.000000 0.000000"
+        elif style == "velocity_m":
+            suffix = f"v 0.000000 0.000000 0.000000 m {flags}"
+        elif style == "malformed":
+            suffix = f"{flags} v invalid 0.000000 0.000000"
+        else:
+            raise ValueError(style)
+        lines.append(f"{index}.0 0.0 0.0 {suffix}")
     return "\n".join(lines) + "\n"
 
 
@@ -44,6 +57,7 @@ def make_result(
     mobility=((0, 0, 0), (1, 0, 1)),
     calculation="relax",
     relax_new=1,
+    mobility_style="m",
 ):
     (tmp_path / "INPUT").write_text(
         "\n".join(
@@ -58,7 +72,7 @@ def make_result(
         + "\n",
         encoding="utf-8",
     )
-    (tmp_path / "STRU").write_text(_stru(mobility), encoding="utf-8")
+    (tmp_path / "STRU").write_text(_stru(mobility, style=mobility_style), encoding="utf-8")
     out_dir = tmp_path / "OUT.ABACUS"
     out_dir.mkdir()
     (out_dir / "INPUT").write_text(
@@ -140,3 +154,94 @@ def test_missing_relax_evidence_is_unknown(tmp_path):
     result = make_result(tmp_path, stdout_name="custom.stdout", stdout="no evidence")
 
     assert result["relax_converge"] is None
+
+
+@pytest.mark.parametrize("style", ["bare", "bare_velocity", "m", "m_velocity", "velocity_m"])
+def test_force_fallback_honors_mobility_with_optional_velocity(tmp_path, style):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.log",
+        stdout=_force_block(((0.0, 0.0, -0.5523930502), (0.0, 0.0, -0.0147588701))),
+        mobility=((0, 0, 0), (1, 1, 1)),
+        mobility_style=style,
+    )
+
+    assert result["largest_gradient"][-1] == pytest.approx(0.0147588701)
+    assert result["relax_converge"] is True
+
+
+@pytest.mark.parametrize("gradient, expected", [(0.014759, True), (0.050000, False)])
+@pytest.mark.parametrize("unit", ["eV/A", "eV/Angstrom", "eV/Å"])
+def test_actual_v3101_gradient_marker_is_authoritative(tmp_path, gradient, expected, unit):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.log",
+        stdout=f"LARGEST GRAD ({unit})  : {gradient}\n"
+        + _force_block(((0.0, 0.0, -0.5523930502), (0.0, 0.0, -0.0147588701))),
+        mobility=((0, 0, 0), (1, 1, 1)),
+        mobility_style="bare_velocity",
+    )
+
+    assert result["largest_gradient"][-1] == pytest.approx(gradient)
+    assert result["relax_converge"] is expected
+
+
+@pytest.mark.parametrize("unit", ["Ry/Bohr", "kbar"])
+@pytest.mark.parametrize("with_forces", [False, True])
+def test_incompatible_gradient_unit_cannot_claim_force_convergence(tmp_path, unit, with_forces):
+    stdout = f"LARGEST GRAD ({unit})  : 0.014759"
+    if with_forces:
+        stdout += "\n" + _force_block(((0.0, 0.0, -0.5523930502), (0.0, 0.0, -0.05)))
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.log",
+        stdout=stdout,
+        mobility=((0, 0, 0), (1, 1, 1)),
+        mobility_style="bare_velocity",
+    )
+
+    if with_forces:
+        assert result["largest_gradient"][-1] == pytest.approx(0.05)
+        assert result["relax_converge"] is False
+    else:
+        assert result["largest_gradient"] is None
+        assert result["relax_converge"] is None
+
+
+def test_malformed_velocity_does_not_erase_force_evidence(tmp_path):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.log",
+        stdout=_force_block(((0.0, 0.0, -0.5523930502), (0.0, 0.0, -0.0147588701))),
+        mobility=((0, 0, 0), (1, 1, 1)),
+        mobility_style="malformed",
+    )
+
+    assert result["largest_gradient"][-1] == pytest.approx(0.5523930502)
+    assert result["relax_converge"] is False
+
+
+def test_all_fixed_with_velocity_and_no_gradient_marker_stays_unknown(tmp_path):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.log",
+        stdout=_force_block(((0.0, 0.0, -0.5523930502), (0.0, 0.0, -0.0147588701))),
+        mobility=((0, 0, 0), (0, 0, 0)),
+        mobility_style="bare_velocity",
+    )
+
+    assert result["largest_gradient"] is None
+    assert result["relax_converge"] is None
+
+
+def test_all_mobile_with_velocity_still_checks_force_threshold(tmp_path):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.log",
+        stdout=_force_block(((0.0, 0.0, -0.022), (0.0, 0.0, -0.014))),
+        mobility=((1, 1, 1), (1, 1, 1)),
+        mobility_style="bare_velocity",
+    )
+
+    assert result["largest_gradient"][-1] == pytest.approx(0.022)
+    assert result["relax_converge"] is False

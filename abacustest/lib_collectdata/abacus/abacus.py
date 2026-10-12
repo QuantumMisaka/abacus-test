@@ -48,6 +48,51 @@ def _mobility_components(result):
     mobility = []
     in_positions = False
     float_pattern = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+    value_counts = {
+        "v": (3,), "vel": (3,), "velocity": (3,),
+        "mag": (1, 3), "magmom": (1, 3),
+        "angle1": (1,), "angle2": (1,),
+        "constrain": (1, 3), "sc": (1, 3), "lambda": (1, 3),
+    }
+
+    def parse_flags(values):
+        if len(values) != 3:
+            return None
+        try:
+            flags = [int(value) for value in values]
+        except ValueError:
+            return None
+        return flags if all(value in (0, 1) for value in flags) else None
+
+    def parse_position(tokens):
+        flags = None
+        index = 3
+        while index < len(tokens):
+            tag = tokens[index].lower()
+            if tag == "m":
+                if flags is not None:
+                    return None
+                flags = parse_flags(tokens[index + 1:index + 4])
+                if flags is None:
+                    return None
+                index += 4
+            elif flags is None and index == 3 and tag not in value_counts:
+                flags = parse_flags(tokens[index:index + 3])
+                if flags is None:
+                    return None
+                index += 3
+            elif tag in value_counts:
+                end = index + 1
+                while end < len(tokens) and tokens[end].lower() not in value_counts and tokens[end].lower() != "m":
+                    end += 1
+                values = tokens[index + 1:end]
+                if len(values) not in value_counts[tag] or not all(float_pattern.match(value) for value in values):
+                    return None
+                index = end
+            else:
+                return None
+        return flags
+
     for line in result.STRU:
         stripped = line.strip()
         upper = stripped.upper()
@@ -56,27 +101,10 @@ def _mobility_components(result):
             continue
         if not in_positions:
             continue
-        tokens = stripped.split()
+        tokens = stripped.split("#", 1)[0].split()
         if len(tokens) < 3 or not all(float_pattern.match(token) for token in tokens[:3]):
             continue
-        atom_mobility = None
-        for index, token in enumerate(tokens[3:], 3):
-            if token.lower() == "m" and len(tokens) >= index + 4:
-                try:
-                    values = [int(tokens[index + offset]) for offset in range(1, 4)]
-                except ValueError:
-                    values = []
-                if len(values) == 3 and all(value in (0, 1) for value in values):
-                    atom_mobility = values
-                break
-        if atom_mobility is None and len(tokens) == 6:
-            try:
-                values = [int(token) for token in tokens[3:6]]
-            except ValueError:
-                values = []
-            if len(values) == 3 and all(value in (0, 1) for value in values):
-                atom_mobility = values
-        mobility.append(atom_mobility)
+        mobility.append(parse_position(tokens))
     return mobility
 
 
@@ -499,8 +527,8 @@ class Abacus(ResultAbacus):
                 matches = re.findall(number, line)
                 if matches:
                     explicit.append(float(matches[-1]))
-            elif re.search(r"largest\s+grad(?:ient)?\s*=", line, re.IGNORECASE):
-                matches = re.findall(number, line.split("=", 1)[1])
+            elif re.search(r"largest\s+grad(?:ient)?\s*(?:\(\s*eV\s*/\s*(?:A|Angstrom|Å)\s*\))?\s*[:=]", line, re.IGNORECASE):
+                matches = re.findall(number, re.split(r"[:=]", line, maxsplit=1)[1])
                 if matches:
                     explicit.append(float(matches[0]))
             elif re.search(r"largest\s+force\s*=|largest\s+force\s+", line, re.IGNORECASE):
