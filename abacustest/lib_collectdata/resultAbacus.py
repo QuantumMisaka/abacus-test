@@ -28,6 +28,7 @@ class ResultAbacus(Result):
         self.KPT = comm.ReadFile(self.KPTf, warn=False)
         
         # screen output
+        self._OUTPUTf_explicit = output is not None
         self.OUTPUTf = output if output is not None else comm.FindOutput(self.PATH, keyinfo="Atomic-orbital Based Ab-initio")
         if self.OUTPUTf is None:
             print("WARNING: can not find the output of ABACUS in %s" % self.PATH)

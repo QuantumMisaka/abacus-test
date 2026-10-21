@@ -1,13 +1,33 @@
-import os,sys,glob,re,traceback
+import os,sys,glob,re,traceback,math
 from ..resultAbacus import ResultAbacus
 from .. import comm
 import numpy as np
 
 KS_SOLVER_LIST = ['DA','DS','GE','GV','BP','CG','CU','PE','LA']
+_CONFLICT = object()
+
+
+def _ion_step(line):
+    match = re.search(r"\bION\s*(?:STEP\s*)?[:=]?\s*(\d+)\b", line, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _current_segment(lines):
+    """Keep the latest identifiable ionic run in an appended log."""
+    last_step = None
+    start = 0
+    for index, line in enumerate(lines):
+        step = _ion_step(line)
+        if step is None:
+            continue
+        if last_step is not None and step < last_step:
+            start = index
+        last_step = step
+    return lines[start:]
 
 
 def _discover_stdout_paths(result):
-    """Discover captured stdout before falling back to running_*.log."""
+    """Find named files for this run; use arbitrary root files only as a last resort."""
     paths = []
 
     def add(path):
@@ -20,27 +40,117 @@ def _discover_stdout_paths(result):
         if os.path.isfile(path) and path not in paths:
             paths.append(path)
 
-    add(getattr(result, "OUTPUTf", None))
-    for name in ("abacus.log", "abacus.out"):
+    # FindOutput scans every file for a banner and may return an old log. Only
+    # the caller's explicit output path carries that provenance by itself.
+    if getattr(result, "_OUTPUTf_explicit", False):
+        add(getattr(result, "OUTPUTf", None))
+    for name in ("abacus.log", "abacus.out", "out.log"):
         add(os.path.join(result.PATH, name))
-    candidates = []
-    for pattern in ("*.out", "*.log", "*.stdout"):
-        candidates.extend(glob.glob(os.path.join(os.fspath(result.PATH), pattern)))
-    running_log = os.path.abspath(os.fspath(getattr(result, "LOGf", "")))
-    for path in sorted(set(candidates)):
-        if os.path.abspath(path) != running_log:
-            add(path)
-    # Keep the running log as the final candidate.  Some ABACUS fixtures have
-    # a short scheduler stdout plus the force table only in running_*.log.
     add(getattr(result, "LOGf", None))
+    if not paths:
+        candidates = []
+        # Unknown *.log files may belong to an earlier calculation. An
+        # alternate log name must be supplied through OUTPUTf explicitly.
+        for pattern in ("*.out", "*.stdout"):
+            candidates.extend(glob.glob(os.path.join(os.fspath(result.PATH), pattern)))
+        for path in sorted(set(candidates)):
+            add(path)
     return paths
 
 
-def _stdout_lines(result):
-    lines = []
+def _stdout_lines(result, evidence, label):
+    """Select one signal from one current source, never concatenate log files.
+
+    A named screen output and the current running log may carry different
+    signals. If two sources carry conflicting values for the same signal,
+    neither can be used as a factual relaxation result.
+    """
+    selected_lines = None
+    selected_value = None
     for path in _discover_stdout_paths(result):
-        lines.extend(comm.ReadFile(path, warn=False))
-    return lines
+        lines = _current_segment(comm.ReadFile(path, warn=False))
+        value = evidence(lines)
+        if value is _CONFLICT:
+            print("Warning: conflicting %s within %s" % (label, path))
+            return [], True
+        if value is None:
+            continue
+        if selected_lines is not None and value != selected_value:
+            print("Warning: conflicting %s across current ABACUS log sources" % label)
+            return [], True
+        selected_lines, selected_value = lines, value
+    return selected_lines or [], False
+
+
+def _gradient_markers(lines):
+    """Group aliases by explicit ionic step; ambiguous unlabeled aliases are unknown."""
+    number = r"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
+    force, stress = [], []
+    force_steps, stress_steps = {}, {}
+    step = None
+    saw_unlabeled_kind = None
+    for line in lines:
+        next_step = _ion_step(line)
+        if next_step is not None:
+            if (step is None and (force or stress)) or (step is not None and next_step < step):
+                # An ionic-step restart begins a new run segment. A labeled
+                # segment also supersedes earlier unlabeled observations.
+                force, stress = [], []
+                force_steps, stress_steps = {}, {}
+                saw_unlabeled_kind = None
+            step = next_step
+        kind, value = None, None
+        if re.search(r"largest\s+gradient\s+in\s+stress", line, re.IGNORECASE):
+            match = re.findall(number, line)
+            if match:
+                kind, value = "stress", float(match[-1])
+        elif re.search(r"largest\s+gradient\s+in\s+force", line, re.IGNORECASE):
+            match = re.findall(number, line)
+            if match:
+                kind, value = "gradient_force", float(match[-1])
+        elif re.search(r"largest\s+gradient\s+is", line, re.IGNORECASE):
+            match = re.findall(number, line)
+            if match:
+                kind, value = "gradient_is", float(match[-1])
+        elif re.search(r"largest\s+grad(?:ient)?\s*(?:\(\s*eV\s*/\s*(?:A|Angstrom|Å)\s*\))?\s*[:=]", line, re.IGNORECASE):
+            match = re.findall(number, re.split(r"[:=]", line, maxsplit=1)[1])
+            if match:
+                kind, value = "gradient_unit", float(match[0])
+        elif re.search(r"largest\s+force(?:\s*=|\s+)", line, re.IGNORECASE):
+            match = re.findall(number, re.split(r"force", line, maxsplit=1, flags=re.IGNORECASE)[-1])
+            if match:
+                kind, value = "force", float(match[0])
+        if value is None:
+            continue
+        values = stress if kind == "stress" else force
+        steps = stress_steps if kind == "stress" else force_steps
+        if step is None and kind != "stress":
+            if saw_unlabeled_kind is not None and kind != saw_unlabeled_kind:
+                return _CONFLICT
+            saw_unlabeled_kind = kind
+        if step is not None and step in steps:
+            if not math.isclose(values[steps[step]], value, rel_tol=1e-5, abs_tol=1e-6):
+                return _CONFLICT
+            continue
+        if step is not None:
+            steps[step] = len(values)
+        values.append(value)
+    return (force or None, stress or None)
+
+
+def _gradient_component(lines, index):
+    gradients = _gradient_markers(lines)
+    return _CONFLICT if gradients is _CONFLICT else gradients[index]
+
+
+def _relax_status(lines):
+    for line in reversed(lines):
+        if "Relaxation is converged!" in line or "Lattice relaxation is converged!" in line or "Ion relaxation is converged!" in line:
+            return True
+        if ("Relaxation is not converged yet!" in line or "Ion relaxation is not converged yet" in line or
+                "Lattice relaxation is not converged yet" in line):
+            return False
+    return None
 
 
 def _mobility_components(result):
@@ -116,6 +226,26 @@ def _energy_difference(lines):
             if values:
                 return float(values[-1])
     return None
+
+
+def _force_tables(lines):
+    forces = []
+    value_pattern = re.compile(r'^\s*\S+\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s*$')
+    for i, line in enumerate(lines):
+        if 'TOTAL-FORCE (eV/Angstrom)' not in line:
+            continue
+        j = i + 1
+        while j < min(i + 10, len(lines)) and not value_pattern.match(lines[j]):
+            j += 1
+        if j >= min(i + 10, len(lines)):
+            continue
+        force = []
+        while j < len(lines) and value_pattern.match(lines[j]):
+            force.extend(float(value) for value in lines[j].split()[1:4])
+            j += 1
+        if force:
+            forces.append(force)
+    return forces or None
 
 class Abacus(ResultAbacus):
     
@@ -423,30 +553,8 @@ class Abacus(ResultAbacus):
     @ResultAbacus.register(force="list[3*natoms], force of the system, if is MD or RELAX calculation, this is the last one",
                            forces = "list of force, the force of each ION step. Dimension is [nstep,3*natom]")
     def GetForceFromLog(self):
-        forces = []
-        evidence = _stdout_lines(self)
-        for i in range(len(evidence)):
-            #i = -1*i - 1
-            line = evidence[i]
-            if 'TOTAL-FORCE (eV/Angstrom)' in line:
-                #head_pattern = re.compile(r'^\s*atom\s+x\s+y\s+z\s*$')
-                value_pattern = re.compile(r'^\s*\S+\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s*$')
-                j = i + 1
-                noforce = False
-                while j < len(evidence) and not value_pattern.match(evidence[j]):
-                    j += 1
-                    if j >= i + 10 or j >= len(evidence):
-                        print("Warning: can not find the first line of force")
-                        noforce = True
-                        break
-                if noforce:
-                    continue
-                
-                force = []
-                while j < len(evidence) and value_pattern.match(evidence[j]):
-                    force += [float(ii) for ii in evidence[j].split()[1:4]]
-                    j += 1
-                if force: forces.append(force)
+        evidence, conflict = _stdout_lines(self, _force_tables, "force tables")
+        forces = None if conflict else _force_tables(evidence)
         if forces:        
             self['force'] = forces[-1]
             self["forces"] = forces
@@ -514,40 +622,24 @@ class Abacus(ResultAbacus):
                            largest_gradient_stress="list, the largest stress of each ION step. Unit in kbar")
     def GetLargestGradientFromLog(self):
         lg, lg_stress = None, None
-        explicit = []
-        number = r"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
-        for line in _stdout_lines(self):
-            if re.search(r"largest\s+gradient\s+in\s+force", line, re.IGNORECASE):
-                if lg == None:
-                    lg = []
-                matches = re.findall(number, line)
-                if matches:
-                    explicit.append(float(matches[-1]))
-            elif re.search(r"largest\s+gradient\s+is", line, re.IGNORECASE):
-                matches = re.findall(number, line)
-                if matches:
-                    explicit.append(float(matches[-1]))
-            elif re.search(r"largest\s+grad(?:ient)?\s*(?:\(\s*eV\s*/\s*(?:A|Angstrom|Å)\s*\))?\s*[:=]", line, re.IGNORECASE):
-                matches = re.findall(number, re.split(r"[:=]", line, maxsplit=1)[1])
-                if matches:
-                    explicit.append(float(matches[0]))
-            elif re.search(r"largest\s+force\s*=|largest\s+force\s+", line, re.IGNORECASE):
-                matches = re.findall(number, line.split("force", 1)[-1])
-                if matches:
-                    explicit.append(float(matches[0]))
-            elif "Largest gradient in stress" in line:
-                # Largest gradient in stress is 10.208693
-                if lg_stress == None:
-                    lg_stress = []
-                matches = re.findall(number, line)
-                if matches:
-                    lg_stress.append(float(matches[-1]))
-
-        # Explicit ABACUS markers are authoritative over force-table fallback.
-        if explicit:
-            lg = explicit
+        force_lines, force_conflict = _stdout_lines(
+            self, lambda lines: _gradient_component(lines, 0),
+            "largest force gradient",
+        )
+        stress_lines, stress_conflict = _stdout_lines(
+            self, lambda lines: _gradient_component(lines, 1),
+            "largest stress gradient",
+        )
+        if not force_conflict:
+            parsed = _gradient_markers(force_lines)
+            if parsed is not _CONFLICT:
+                lg = parsed[0]
+        if not stress_conflict:
+            parsed = _gradient_markers(stress_lines)
+            if parsed is not _CONFLICT:
+                lg_stress = parsed[1]
         
-        if lg is None:
+        if lg is None and not force_conflict:
             forces = self["forces"]
             if forces is not None:
                 mobility = _mobility_components(self)
@@ -563,7 +655,7 @@ class Abacus(ResultAbacus):
                 if any(value is not None for value in values):
                     lg = values
         
-        if lg_stress is None:
+        if lg_stress is None and not stress_conflict:
             stresses = self["stresses"]
             if stresses is not None:
                 lg_stress = [max([abs(i) for i in j]) for j in stresses]
@@ -1216,25 +1308,22 @@ class AbacusRelax(ResultAbacus):
     @ResultAbacus.register(relax_converge="if the relax is converged")
     def GetRelaxConverge(self):
         converge = None
-        evidence = _stdout_lines(self)
-        for line in reversed(evidence):
-            if "Relaxation is converged!" in line:
-                converge = True
-            elif "Relaxation is not converged yet!" in line:
-                converge = False
-            elif "Ion relaxation is not converged yet" in line or \
-                "Lattice relaxation is not converged yet" in line:
-                converge = False
-            elif "Lattice relaxation is converged!" in line or \
-                "Ion relaxation is converged!" in line:
-                converge = True
-            if converge is not None:
-                break
+        evidence, status_conflict = _stdout_lines(self, _relax_status, "relaxation status")
+        if not status_conflict:
+            converge = _relax_status(evidence)
 
         # In some versions ABACUS does not print an explicit statement.  Use
         # only evidence that is actually present; a missing stdout must remain
         # unknown instead of being reported as a failed relaxation.
-        if converge is None:
+        if converge is None and not status_conflict:
+            evidence, gradient_conflict = _stdout_lines(
+                self,
+                lambda lines: _gradient_component(lines, 0),
+                "largest force gradient",
+            )
+            if gradient_conflict:
+                self["relax_converge"] = None
+                return None
             lg_force = self["largest_gradient"]
             lg_stress = self["largest_gradient_stress"]
             params = self["INPUT"]
@@ -1258,7 +1347,10 @@ class AbacusRelax(ResultAbacus):
                 else:
                     # The legacy relaxation path has two required pieces of
                     # evidence: force and electronic energy difference.
-                    energy_difference = _energy_difference(evidence)
+                    energy_lines, energy_conflict = _stdout_lines(
+                        self, _energy_difference, "energy difference"
+                    )
+                    energy_difference = None if energy_conflict else _energy_difference(energy_lines)
                     energy_thr = params.get("scf_ene_thr")
                     if energy_thr is None:
                         energy_thr = params.get("energy_thr", params.get("relax_energy_thr"))

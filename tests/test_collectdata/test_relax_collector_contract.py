@@ -139,6 +139,18 @@ def test_old_relax_without_energy_difference_is_unknown(tmp_path):
     assert result["relax_converge"] is None
 
 
+def test_old_relax_uses_energy_difference_with_force_table_fallback(tmp_path):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.out",
+        relax_new=0,
+        stdout=_force_block(((0.0, 0.0, 0.0), (0.01, 0.02, 0.01))) + "\nenergy difference 0.01",
+    )
+
+    assert result["largest_gradient"][-1] == pytest.approx(0.01)
+    assert result["relax_converge"] is True
+
+
 def test_new_relax_fallback_uses_force_threshold_without_energy_requirement(tmp_path):
     result = make_result(
         tmp_path,
@@ -245,3 +257,197 @@ def test_all_mobile_with_velocity_still_checks_force_threshold(tmp_path):
 
     assert result["largest_gradient"][-1] == pytest.approx(0.022)
     assert result["relax_converge"] is False
+
+
+def test_duplicate_current_stdout_does_not_double_gradient_steps(tmp_path):
+    current = "ION STEP 1\nLARGEST GRAD (eV/A) : 0.1\nION STEP 2\nLARGEST GRAD (eV/A) : 0.01"
+    result = make_result(tmp_path, stdout_name="abacus.out", stdout=current)
+    (tmp_path / "abacus.log").write_text(current + "\n", encoding="utf-8")
+
+    assert result["largest_gradient"] == [0.1, 0.01]
+    assert result["relax_converge"] is True
+
+
+def test_same_ion_step_gradient_aliases_are_one_sample(tmp_path):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.out",
+        stdout=(
+            "ION STEP 1\nlargest force 0.1\nLARGEST GRAD (eV/A) : 0.1\n"
+            "ION STEP 2\nlargest force 0.01\nLARGEST GRAD (eV/A) : 0.01"
+        ),
+    )
+
+    assert result["largest_gradient"] == [0.1, 0.01]
+
+
+def test_stale_generic_log_cannot_change_current_convergence(tmp_path):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.out",
+        stdout="ION STEP 1\nLARGEST GRAD (eV/A) : 0.1\nION STEP 2\nLARGEST GRAD (eV/A) : 0.01",
+    )
+    (tmp_path / "z_previous.log").write_text(
+        "ION STEP 99\nLARGEST GRAD (eV/A) : 0.8\nRelaxation is not converged yet!\n",
+        encoding="utf-8",
+    )
+
+    assert result["largest_gradient"] == [0.1, 0.01]
+    assert result["relax_converge"] is True
+
+
+def test_unidentified_log_alone_cannot_supply_relaxation_evidence(tmp_path):
+    result = make_result(tmp_path, stdout_name="z_previous.log", stdout="LARGEST GRAD (eV/A) : 0.01")
+
+    assert result["largest_gradient"] is None
+    assert result["relax_converge"] is None
+
+
+def test_auto_found_old_banner_log_cannot_override_current_stdout(tmp_path):
+    make_result(
+        tmp_path, stdout_name="abacus.out",
+        stdout="ION STEP 1\nLARGEST GRAD (eV/A) : 0.1",
+    )
+    (tmp_path / "z_previous.log").write_text(
+        "Atomic-orbital Based Ab-initio\nION STEP 1\n"
+        "LARGEST GRAD (eV/A) : 0.01\nRelaxation is converged!\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["largest_gradient"] == [0.1]
+    assert result["relax_converge"] is False
+
+
+def test_auto_found_old_banner_log_alone_is_not_current_evidence(tmp_path):
+    make_result(tmp_path, stdout_name="z_previous.log", stdout="")
+    (tmp_path / "z_previous.log").write_text(
+        "Atomic-orbital Based Ab-initio\nION STEP 1\n"
+        "LARGEST GRAD (eV/A) : 0.01\nRelaxation is converged!\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["largest_gradient"] is None
+    assert result["relax_converge"] is None
+
+
+def test_explicit_custom_log_keeps_caller_selected_output(tmp_path):
+    make_result(tmp_path, stdout_name="custom.log", stdout="")
+    custom = tmp_path / "custom.log"
+    custom.write_text(
+        "ION STEP 1\nLARGEST GRAD (eV/A) : 0.01\nRelaxation is converged!\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus", output=custom)
+
+    assert result["largest_gradient"] == [0.01]
+    assert result["relax_converge"] is True
+
+
+def test_conflicting_current_stdout_sources_leave_force_convergence_unknown(tmp_path):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.out",
+        stdout="ION STEP 1\nLARGEST GRAD (eV/A) : 0.01",
+    )
+    (tmp_path / "abacus.log").write_text(
+        "ION STEP 1\nLARGEST GRAD (eV/A) : 0.1\n", encoding="utf-8"
+    )
+
+    assert result["largest_gradient"] is None
+    assert result["relax_converge"] is None
+
+
+def test_adjacent_equal_gradients_at_distinct_steps_are_preserved(tmp_path):
+    result = make_result(
+        tmp_path,
+        stdout_name="abacus.out",
+        stdout="ION STEP 1\nLARGEST GRAD (eV/A) : 0.01\nION STEP 2\nLARGEST GRAD (eV/A) : 0.01",
+    )
+
+    assert result["largest_gradient"] == [0.01, 0.01]
+
+
+def test_unlabeled_equal_values_with_same_marker_remain_two_samples(tmp_path):
+    result = make_result(
+        tmp_path, stdout_name="abacus.out",
+        stdout="LARGEST GRAD (eV/A) : 0.01\nLARGEST GRAD (eV/A) : 0.01",
+    )
+
+    assert result["largest_gradient"] == [0.01, 0.01]
+
+
+def test_current_running_log_supplies_missing_screen_force_signal(tmp_path):
+    result = make_result(tmp_path, stdout_name="abacus.out", stdout="scheduler output only")
+    output_dir = tmp_path / "OUT.ABACUS"
+    (output_dir / "running_relax.log").write_text(
+        "ION STEP 1\nLARGEST GRAD (eV/A) : 0.01\n", encoding="utf-8"
+    )
+
+    assert result["largest_gradient"] == [0.01]
+    assert result["relax_converge"] is True
+
+
+def test_conflicting_explicit_status_is_unknown(tmp_path):
+    result = make_result(
+        tmp_path, stdout_name="abacus.out",
+        stdout="Relaxation is converged!",
+    )
+    (tmp_path / "abacus.log").write_text(
+        "Relaxation is not converged yet!\n", encoding="utf-8"
+    )
+
+    assert result["relax_converge"] is None
+
+
+def test_ionic_step_restart_uses_latest_segment(tmp_path):
+    result = make_result(
+        tmp_path, stdout_name="abacus.out",
+        stdout=(
+            "ION STEP 1\nLARGEST GRAD (eV/A) : 0.8\n"
+            "ION STEP 2\nLARGEST GRAD (eV/A) : 0.7\n"
+            "ION STEP 1\nLARGEST GRAD (eV/A) : 0.1\n"
+            "ION STEP 2\nLARGEST GRAD (eV/A) : 0.01"
+        ),
+    )
+
+    assert result["largest_gradient"] == [0.1, 0.01]
+    assert result["relax_converge"] is True
+
+
+def test_status_before_ionic_restart_cannot_complete_latest_segment(tmp_path):
+    result = make_result(
+        tmp_path, stdout_name="abacus.out",
+        stdout=(
+            "ION STEP 1\nLARGEST GRAD (eV/A) : 0.02\n"
+            "ION STEP 2\nLARGEST GRAD (eV/A) : 0.01\nRelaxation is converged!\n"
+            "ION STEP 1\nLARGEST GRAD (eV/A) : 0.1"
+        ),
+    )
+
+    assert result["largest_gradient"] == [0.1]
+    assert result["relax_converge"] is False
+
+
+def test_unlabeled_mixed_gradient_markers_cannot_be_assigned_to_steps(tmp_path):
+    result = make_result(
+        tmp_path, stdout_name="abacus.out",
+        stdout="largest force 0.01\nLARGEST GRAD (eV/A) : 0.01",
+    )
+
+    assert result["largest_gradient"] is None
+    assert result["relax_converge"] is None
+
+
+def test_cross_source_precision_disagreement_is_unknown(tmp_path):
+    result = make_result(
+        tmp_path, stdout_name="abacus.out",
+        stdout="ION STEP 1\nLARGEST GRAD (eV/A) : 0.020000",
+    )
+    (tmp_path / "abacus.log").write_text(
+        "ION STEP 1\nLARGEST GRAD (eV/A) : 0.0199999\n", encoding="utf-8"
+    )
+
+    assert result["largest_gradient"] is None
+    assert result["relax_converge"] is None
