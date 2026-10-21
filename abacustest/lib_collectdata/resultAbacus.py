@@ -93,15 +93,7 @@ class ResultAbacus(Result):
             return None
 
     def ReadJson(self):
-        return None
-        if os.path.isfile(os.path.join(self.PATH,"abacus.json")):
-            try:
-                jsons = json.load(open(os.path.join(self.PATH,"abacus.json")))
-                return jsons
-            except:
-                print("WARNING: can not read abacus.json")
-                traceback.print_exc()
-                return None
+        """The collector does not consume ABACUS's retired abacus.json output."""
         return None
     
     def GetTime(self,class_name,func_name):

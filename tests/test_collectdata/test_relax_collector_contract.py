@@ -451,3 +451,183 @@ def test_cross_source_precision_disagreement_is_unknown(tmp_path):
 
     assert result["largest_gradient"] is None
     assert result["relax_converge"] is None
+
+
+def test_auto_discovered_custom_stdout_complements_running_log(tmp_path):
+    make_result(
+        tmp_path,
+        stdout_name="custom.stdout",
+        stdout=(
+            "Atomic-orbital Based Ab-initio\n"
+            "ION STEP 1\nLARGEST GRAD (eV/A) : 0.012"
+        ),
+    )
+    (tmp_path / "OUT.ABACUS" / "running_relax.log").write_text(
+        "ION STEP 1\nfinal etot is -2.0 eV\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["largest_gradient"] == [pytest.approx(0.012)]
+    assert result["relax_converge"] is True
+    assert result["energies"] == [-2.0]
+
+
+def _stress_block(diagonal):
+    return (
+        "TOTAL-STRESS (KBAR)\n"
+        f"{diagonal} 0 0\n0 {diagonal} 0\n0 0 {diagonal}"
+    )
+
+
+def test_appended_relax_uses_latest_segment_for_all_log_results(tmp_path):
+    make_result(tmp_path, stdout_name="abacus.out", stdout="scheduler only")
+    old_first = (
+        "ION STEP 1\nfinal etot is -1.0 eV\n!FINAL_ETOT_IS -1.0 eV\n"
+        "charge density convergence is achieved\n"
+        + _force_block(((0.1, 0.0, 0.0), (0.0, 0.0, 0.0))) + "\n"
+        + _stress_block(1.0) + "\n"
+    )
+    old_second = (
+        "ION STEP 2\nfinal etot is -2.0 eV\n!FINAL_ETOT_IS -2.0 eV\n"
+        + _force_block(((0.2, 0.0, 0.0), (0.0, 0.0, 0.0))) + "\n"
+        + _stress_block(2.0) + "\n"
+    )
+    latest = (
+        "ION STEP 1\nfinal etot is -3.0 eV\n!FINAL_ETOT_IS -3.0 eV\n"
+        "convergence has NOT been achieved!\n"
+        + _force_block(((0.3, 0.0, 0.0), (0.0, 0.0, 0.0))) + "\n"
+        + _stress_block(3.0) + "\n"
+    )
+    (tmp_path / "OUT.ABACUS" / "running_relax.log").write_text(
+        old_first + old_second + latest, encoding="utf-8"
+    )
+    # ResultAbacus loads the runtime log when constructed.
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["energies"] == [-3.0]
+    assert result["energy"] == -3.0
+    assert result["converge"] is False
+    assert result["forces"] == [[0.3, 0.0, 0.0, 0.0, 0.0, 0.0]]
+    assert result["stresses"] == [[3.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 3.0]]
+
+
+def test_incomplete_latest_segment_does_not_inherit_old_results(tmp_path):
+    make_result(tmp_path, stdout_name="abacus.out", stdout="scheduler only")
+    previous = (
+        "ION STEP 1\nfinal etot is -1.0 eV\n!FINAL_ETOT_IS -1.0 eV\n"
+        "charge density convergence is achieved\n"
+        + _force_block(((0.1, 0.0, 0.0), (0.0, 0.0, 0.0))) + "\n"
+        + _stress_block(1.0) + "\n"
+        "ION STEP 2\nfinal etot is -2.0 eV\n!FINAL_ETOT_IS -2.0 eV\n"
+    )
+    (tmp_path / "OUT.ABACUS" / "running_relax.log").write_text(
+        previous + "ION STEP 1\nSCF is still running\n", encoding="utf-8"
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["energy"] is None
+    assert result["energies"] is None
+    assert result["converge"] is None
+    assert result["forces"] is None
+    assert result["stresses"] is None
+    assert result["relax_converge"] is None
+
+
+def test_new_one_step_run_start_drops_completed_previous_results(tmp_path):
+    make_result(tmp_path, stdout_name="abacus.out", stdout="scheduler only")
+    (tmp_path / "OUT.ABACUS" / "running_relax.log").write_text(
+        "Start Time is Mon Oct 19 10:00:00 2026\n"
+        "ION STEP 1\nfinal etot is -1.0 eV\n!FINAL_ETOT_IS -1.0 eV\n"
+        "charge density convergence is achieved\nRelaxation is converged!\n"
+        + _force_block(((0.01, 0.0, 0.0), (0.0, 0.0, 0.0))) + "\n"
+        + _stress_block(1.0) + "\n"
+        "Start Time is Tue Oct 20 10:00:00 2026\nION STEP 1\nSCF is still running\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["energy"] is None
+    assert result["energies"] is None
+    assert result["converge"] is None
+    assert result["forces"] is None
+    assert result["stresses"] is None
+    assert result["relax_converge"] is None
+
+
+def test_auto_found_old_out_cannot_override_named_current_stdout(tmp_path):
+    make_result(
+        tmp_path,
+        stdout_name="abacus.out",
+        stdout="ION STEP 1\nLARGEST GRAD (eV/A) : 0.1",
+    )
+    (tmp_path / "z_previous.out").write_text(
+        "Atomic-orbital Based Ab-initio\nION STEP 1\n"
+        "LARGEST GRAD (eV/A) : 0.01\nRelaxation is converged!\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["largest_gradient"] == [0.1]
+    assert result["relax_converge"] is False
+
+
+def test_magnetism_uses_final_scf_record_per_ionic_step(tmp_path):
+    make_result(tmp_path, stdout_name="abacus.out", stdout="scheduler only")
+    (tmp_path / "OUT.ABACUS" / "running_relax.log").write_text(
+        "ION STEP 1\nION=1 ELEC=1\n"
+        "total magnetism (Bohr mag/cell) = 1\n"
+        "absolute magnetism (Bohr mag/cell) = 2\n"
+        "ION=1 ELEC=2\n"
+        "total magnetism (Bohr mag/cell) = 3\n"
+        "absolute magnetism (Bohr mag/cell) = 4\n"
+        "ION STEP 2\nION=2 ELEC=1\n"
+        "total magnetism (Bohr mag/cell) = 5\n"
+        "absolute magnetism (Bohr mag/cell) = 6\n"
+        "ION=2 ELEC=2\n"
+        "total magnetism (Bohr mag/cell) = 7\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["total_mag"] == 7
+    assert result["absolute_mag"] is None
+    assert result["total_mags"] == [3, 7]
+    assert result["absolute_mags"] == [4, None]
+
+
+def test_started_next_ionic_step_keeps_history_but_no_final_result(tmp_path):
+    make_result(tmp_path, stdout_name="abacus.out", stdout="scheduler only")
+    (tmp_path / "OUT.ABACUS" / "running_relax.log").write_text(
+        "ION STEP 1\nfinal etot is -1.0 eV\n!FINAL_ETOT_IS -1.0 eV\n"
+        "charge density convergence is achieved\nRelaxation is converged!\n"
+        "LARGEST GRAD (eV/A) : 0.01\n"
+        + _force_block(((0.01, 0.0, 0.0), (0.0, 0.0, 0.0))) + "\n"
+        + _stress_block(1.0) + "\n"
+        "ION STEP 2\nSCF is still running\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["energies"] == [-1.0]
+    assert result["forces"] == [[0.01, 0.0, 0.0, 0.0, 0.0, 0.0]]
+    assert result["stresses"] == [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]]
+    assert result["largest_gradient"] == [0.01]
+    assert result["energy"] is None
+    assert result["force"] is None
+    assert result["stress"] is None
+    assert result["converge"] is None
+    assert result["relax_converge"] is None
+
+
+def test_partially_written_latest_stress_table_is_unknown(tmp_path):
+    make_result(tmp_path, stdout_name="abacus.out", stdout="scheduler only")
+    (tmp_path / "OUT.ABACUS" / "running_relax.log").write_text(
+        "ION STEP 1\n" + _stress_block(1.0) + "\n"
+        "ION STEP 2\nTOTAL-STRESS (KBAR)\n2 0 0\n",
+        encoding="utf-8",
+    )
+    result = RESULT(path=tmp_path, fmt="abacus")
+
+    assert result["stresses"] == [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]]
+    assert result["stress"] is None

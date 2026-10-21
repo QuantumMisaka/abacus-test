@@ -17,12 +17,29 @@ def _current_segment(lines):
     last_step = None
     start = 0
     for index, line in enumerate(lines):
+        # A new invocation can restart at the same ionic step (often 1).
+        # ABACUS prints these headers at startup, before any result exists.
+        if re.search(r"^\s*(?:Start Time is\b|Atomic-orbital Based Ab-initio\b)", line, re.IGNORECASE):
+            start = index
+            last_step = None
         step = _ion_step(line)
         if step is None:
             continue
         if last_step is not None and step < last_step:
             start = index
         last_step = step
+    return lines[start:]
+
+
+def _latest_ion_step_segment(lines):
+    """Keep the latest ionic step without discarding completed step history elsewhere."""
+    previous_step = None
+    start = 0
+    for index, line in enumerate(lines):
+        step = _ion_step(line)
+        if step is not None and step != previous_step:
+            start = index
+            previous_step = step
     return lines[start:]
 
 
@@ -40,12 +57,21 @@ def _discover_stdout_paths(result):
         if os.path.isfile(path) and path not in paths:
             paths.append(path)
 
-    # FindOutput scans every file for a banner and may return an old log. Only
-    # the caller's explicit output path carries that provenance by itself.
-    if getattr(result, "_OUTPUTf_explicit", False):
-        add(getattr(result, "OUTPUTf", None))
-    for name in ("abacus.log", "abacus.out", "out.log"):
-        add(os.path.join(result.PATH, name))
+    # FindOutput scans every root file for a banner. Its result is useful as
+    # screen output when it has a screen-output suffix, but an arbitrary old
+    # *.log must not become evidence merely because it contains a banner.
+    output = getattr(result, "OUTPUTf", None)
+    explicit_output = getattr(result, "_OUTPUTf_explicit", False)
+    if explicit_output:
+        add(output)
+    else:
+        for name in ("abacus.log", "abacus.out", "out.log"):
+            add(os.path.join(result.PATH, name))
+        # If no named screen output exists, FindOutput's banner match can
+        # identify a custom .out/.stdout even when the running log exists.
+        # A named output takes precedence over an arbitrary old .out file.
+        if not paths and output is not None and os.path.splitext(os.fspath(output))[1].lower() in (".out", ".stdout"):
+            add(output)
     add(getattr(result, "LOGf", None))
     if not paths:
         candidates = []
@@ -216,6 +242,16 @@ def _mobility_components(result):
             continue
         mobility.append(parse_position(tokens))
     return mobility
+
+
+def _largest_mobile_force(force, mobility):
+    selected = []
+    for atom_index in range(len(force) // 3):
+        atom_mobility = mobility[atom_index] if atom_index < len(mobility) else None
+        for component in range(3):
+            if atom_mobility is None or atom_mobility[component]:
+                selected.append(abs(force[3 * atom_index + component]))
+    return max(selected) if selected else None
 
 
 def _energy_difference(lines):
@@ -438,34 +474,51 @@ class Abacus(ResultAbacus):
                            absolute_mags="absolute magnetism (Bohr mag/cell) of each ION step",
                            )
     def GetMagResult(self): 
-        total_mags = []
-        absolute_mags = []
-        tot_mag = None
-        abs_mag = None
-        ion_step = 1
-        for i,line in enumerate(self.LOG):
-            if "ION=" in line:
-                current_step = int(line.split()[4])
-                if current_step > ion_step:
-                    if tot_mag is not None:
-                        total_mags.append(tot_mag)
-                        absolute_mags.append(abs_mag)
-                ion_step = current_step 
-            elif 'total magnetism (Bohr mag/cell)' in line:
-                sline = line.split()
-                # if the last three are float, then it is the noncollinear case, else it is collinear case
+        records = []
+        current = {"total": None, "absolute": None}
+        ion_step = elec_step = None
+        saw_magnetism = False
+        for line in _current_segment(self.LOG):
+            next_ion = _ion_step(line)
+            if next_ion is not None:
+                if ion_step is not None and next_ion != ion_step:
+                    records.append(current)
+                    current = {"total": None, "absolute": None}
+                    elec_step = None
+                ion_step = next_ion
+                match = re.search(r"\bELEC\s*=\s*(\d+)\b", line, re.IGNORECASE)
+                if match:
+                    next_elec = int(match.group(1))
+                    if elec_step is not None and next_elec != elec_step:
+                        current = {"total": None, "absolute": None}
+                    elec_step = next_elec
+
+            if 'total magnetism (Bohr mag/cell)' in line:
+                values = line.split('=', 1)[-1].split()
                 try:
-                    tot_mag = [float(imag) for imag in sline[-3:]]
-                except:
-                    tot_mag = float(sline[-1])
+                    if len(values) == 3:
+                        current["total"] = [float(value) for value in values]
+                    else:
+                        current["total"] = float(values[-1])
+                except (ValueError, IndexError):
+                    current["total"] = None
+                # A new total starts a new SCF reading; an older absolute
+                # magnetism must not be paired with it.
+                current["absolute"] = None
+                saw_magnetism = True
             elif 'absolute magnetism' in line:
-                abs_mag = float(line.split()[-1])
-        
-        if tot_mag is not None:    
-            self['total_mag'] = tot_mag
-            self['absolute_mag'] = abs_mag
-            self['total_mags'] = total_mags + [tot_mag]
-            self['absolute_mags'] = absolute_mags + [abs_mag]
+                try:
+                    current["absolute"] = float(line.split()[-1])
+                except (ValueError, IndexError):
+                    current["absolute"] = None
+                saw_magnetism = True
+
+        if saw_magnetism:
+            records.append(current)
+            self['total_mag'] = current["total"]
+            self['absolute_mag'] = current["absolute"]
+            self['total_mags'] = [record["total"] for record in records]
+            self['absolute_mags'] = [record["absolute"] for record in records]
         else:
             self['total_mag'] = None
             self['absolute_mag'] = None
@@ -497,13 +550,20 @@ class Abacus(ResultAbacus):
             else:
                 self["energy_per_atom"] = None
         else: 
+            current_log = _current_segment(self.LOG)
+            latest_step = _latest_ion_step_segment(current_log)
             efermi = None
             converge = None
             energy = None
             energies = []
             energies_ks = []
             volume = None
-            for i,line in enumerate(self.LOG):
+            for line in current_log:
+                if "final etot is" in line:
+                    energies.append(float(line.split()[-2]))
+                elif "Volume (A^3) =" in line:
+                    volume = float(line.split()[-1])
+            for line in latest_step:
                 if 'charge density convergence is achieved' in line:
                     converge = True
                 elif 'convergence has NOT been achieved!' in line or\
@@ -511,12 +571,8 @@ class Abacus(ResultAbacus):
                     converge = False
                 elif "!FINAL_ETOT_IS" in line:
                     energy = float(line.split()[1])
-                elif "final etot is" in line:
-                    energies.append(float(line.split()[-2]))
                 elif "E_KohnSham" in line:
                     energies_ks.append(float(line.split()[-1]))
-                elif "Volume (A^3) =" in line:
-                    volume = float(line.split()[-1])
                 elif 'E_Fermi' in line:
                     if 'E_Fermi_up' in line:
                         if efermi == None:
@@ -549,6 +605,8 @@ class Abacus(ResultAbacus):
 
             if self["natom"] != None and self['energy'] != None:
                 self["energy_per_atom"] = self['energy']/self["natom"]
+            else:
+                self["energy_per_atom"] = None
     
     @ResultAbacus.register(force="list[3*natoms], force of the system, if is MD or RELAX calculation, this is the last one",
                            forces = "list of force, the force of each ION step. Dimension is [nstep,3*natom]")
@@ -556,7 +614,8 @@ class Abacus(ResultAbacus):
         evidence, conflict = _stdout_lines(self, _force_tables, "force tables")
         forces = None if conflict else _force_tables(evidence)
         if forces:        
-            self['force'] = forces[-1]
+            latest_forces = _force_tables(_latest_ion_step_segment(evidence))
+            self['force'] = latest_forces[-1] if latest_forces else None
             self["forces"] = forces
         else:
             self['force'] = None
@@ -569,28 +628,34 @@ class Abacus(ResultAbacus):
                            virials="list of virial, the virial of each ION step. Dimension is [nstep,9]",
                            pressures="list of pressure, the pressure of each ION step.")
     def GetStessFromLog(self):
+        current_log = _current_segment(self.LOG)
+        latest_start = len(current_log) - len(_latest_ion_step_segment(current_log))
         stresses = []
-        for i in range(len(self.LOG)):
+        latest_stress = None
+        for i in range(len(current_log)):
             #i = -1*i - 1
-            line = self.LOG[i]
+            line = current_log[i]
             if 'TOTAL-STRESS (KBAR)' in line:
                 value_pattern = re.compile(r'^\s*[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s+[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\s*$')
                 j = i 
                 nostress = False
                 # find the first line of stress
-                while not value_pattern.match(self.LOG[j]):
+                while j < len(current_log) and not value_pattern.match(current_log[j]):
                     j += 1
-                    if j >= i + 10: # if can not find the first line of force in 10 lines, then stop
-                        print("Warning: can not find the first line of force")
+                    if j >= min(i + 10, len(current_log)): # no complete stress table
+                        print("Warning: can not find the first line of stress")
                         nostress = True
                         break
                 if nostress:
                     break
                 stress = []
-                while value_pattern.match(self.LOG[j]):
-                    stress += [float(ii) for ii in self.LOG[j].split()[:3]]
+                while j < len(current_log) and value_pattern.match(current_log[j]):
+                    stress += [float(ii) for ii in current_log[j].split()[:3]]
                     j += 1
-                if stress: stresses.append(stress)
+                if len(stress) == 9:
+                    stresses.append(stress)
+                    if i >= latest_start:
+                        latest_stress = stress
         
         virials = []
         pressures = []
@@ -601,9 +666,12 @@ class Abacus(ResultAbacus):
             pressures.append((stress[0] + stress[4] + stress[8]) / 3.0)
             
         if stresses:
-            self['stress'] = stresses[-1]
+            self['stress'] = latest_stress
             self["stresses"] = stresses
-            self["pressure"] = pressures[-1]
+            self["pressure"] = (
+                (latest_stress[0] + latest_stress[4] + latest_stress[8]) / 3.0
+                if latest_stress is not None else None
+            )
             self["pressures"] = pressures
         else:
             self["stress"] = None
@@ -612,7 +680,10 @@ class Abacus(ResultAbacus):
             self["pressures"] = None
 
         if virials:
-            self['virial'] = virials[-1]
+            self['virial'] = (
+                [value * self["volume"] * comm.KBAR2EVPERANGSTROM3 for value in latest_stress]
+                if latest_stress is not None else None
+            )
             self["virials"] = virials
         else:
             self['virial'] = None
@@ -643,15 +714,7 @@ class Abacus(ResultAbacus):
             forces = self["forces"]
             if forces is not None:
                 mobility = _mobility_components(self)
-                values = []
-                for force in forces:
-                    selected = []
-                    for atom_index in range(len(force) // 3):
-                        atom_mobility = mobility[atom_index] if atom_index < len(mobility) else None
-                        for component in range(3):
-                            if atom_mobility is None or atom_mobility[component]:
-                                selected.append(abs(force[3 * atom_index + component]))
-                    values.append(max(selected) if selected else None)
+                values = [_largest_mobile_force(force, mobility) for force in forces]
                 if any(value is not None for value in values):
                     lg = values
         
@@ -1308,9 +1371,13 @@ class AbacusRelax(ResultAbacus):
     @ResultAbacus.register(relax_converge="if the relax is converged")
     def GetRelaxConverge(self):
         converge = None
-        evidence, status_conflict = _stdout_lines(self, _relax_status, "relaxation status")
+        evidence, status_conflict = _stdout_lines(
+            self,
+            lambda lines: _relax_status(_latest_ion_step_segment(lines)),
+            "relaxation status",
+        )
         if not status_conflict:
-            converge = _relax_status(evidence)
+            converge = _relax_status(_latest_ion_step_segment(evidence))
 
         # In some versions ABACUS does not print an explicit statement.  Use
         # only evidence that is actually present; a missing stdout must remain
@@ -1318,23 +1385,24 @@ class AbacusRelax(ResultAbacus):
         if converge is None and not status_conflict:
             evidence, gradient_conflict = _stdout_lines(
                 self,
-                lambda lines: _gradient_component(lines, 0),
+                lambda lines: _gradient_component(_latest_ion_step_segment(lines), 0),
                 "largest force gradient",
             )
             if gradient_conflict:
                 self["relax_converge"] = None
                 return None
-            lg_force = self["largest_gradient"]
-            lg_stress = self["largest_gradient_stress"]
+            lg_force = _gradient_component(_latest_ion_step_segment(evidence), 0)
+            if lg_force is _CONFLICT:
+                lg_force = None
+            if lg_force is None and self["force"] is not None:
+                latest_force = _largest_mobile_force(self["force"], _mobility_components(self))
+            else:
+                latest_force = lg_force[-1] if lg_force else None
             params = self["INPUT"]
             job_type = params.get("calculation", "scf")
             force_thr = params.get("force_thr_ev")
             if force_thr is None and params.get("force_thr") is not None:
                 force_thr = float(params["force_thr"]) * 25.711396132
-            if isinstance(lg_force, list) and lg_force:
-                latest_force = lg_force[-1]
-            else:
-                latest_force = lg_force
             force_ok = (
                 latest_force is not None and force_thr is not None and
                 latest_force <= float(force_thr)
@@ -1348,15 +1416,31 @@ class AbacusRelax(ResultAbacus):
                     # The legacy relaxation path has two required pieces of
                     # evidence: force and electronic energy difference.
                     energy_lines, energy_conflict = _stdout_lines(
-                        self, _energy_difference, "energy difference"
+                        self,
+                        lambda lines: _energy_difference(_latest_ion_step_segment(lines)),
+                        "energy difference",
                     )
-                    energy_difference = None if energy_conflict else _energy_difference(energy_lines)
+                    energy_difference = (
+                        None if energy_conflict
+                        else _energy_difference(_latest_ion_step_segment(energy_lines))
+                    )
                     energy_thr = params.get("scf_ene_thr")
                     if energy_thr is None:
                         energy_thr = params.get("energy_thr", params.get("relax_energy_thr"))
                     if energy_difference is not None and energy_thr is not None and float(energy_thr) >= 0:
                         converge = force_ok and abs(energy_difference) <= float(energy_thr)
             elif job_type == "cell-relax" and force_ok:
+                stress_lines, stress_conflict = _stdout_lines(
+                    self,
+                    lambda lines: _gradient_component(_latest_ion_step_segment(lines), 1),
+                    "largest stress gradient",
+                )
+                lg_stress = (
+                    None if stress_conflict
+                    else _gradient_component(_latest_ion_step_segment(stress_lines), 1)
+                )
+                if lg_stress is None and self["stress"] is not None:
+                    lg_stress = [max(abs(value) for value in self["stress"])]
                 if isinstance(lg_stress, list) and lg_stress:
                     stress_thr = params.get("stress_thr")
                     converge = stress_thr is not None and lg_stress[-1] <= float(stress_thr)
